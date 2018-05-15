@@ -1,3 +1,18 @@
+/*
+ * Copyright 2017-2018 the original author or authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 import Vue from 'vue'
 import VueRouter from 'vue-router'
 import Vuetify from 'vuetify'
@@ -28,12 +43,11 @@ axios.interceptors.response.use((response) => {
 }, (error) => {
     // 未认证
     if (error.response) {
-        if (error.response.status === 401) {
+        if (!error.config.apiTest && error.response.status === 401) {
             store.commit('loginState', false)
-            Cookies.remove('token')
         }
     } else {
-        alert('服务不可用')
+        alert('连接超时，请重试')
     }
     return Promise.reject(error)
 })
@@ -79,8 +93,8 @@ Vue.prototype.$confirm = function (text, confirmFun, cancelFun) {
         <v-card-text class="body-2">${text}</v-card-text>
         <v-card-actions>
             <v-spacer></v-spacer>
-            <v-btn flat color="info" @click="cancel">取消</v-btn>
-            <v-btn flat color="success" @click="confirm">确认</v-btn>
+            <v-btn flat color="info" @click="cancel" name="confirm__cancel">取消</v-btn>
+            <v-btn flat color="success" @click="confirm" name="confirm__confirm">确认</v-btn>
         </v-card-actions>
     </v-card>
 </v-dialog>`,

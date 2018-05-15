@@ -1,43 +1,61 @@
+/**
+ * Copyright 2017-2018 the original author or authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package io.zhudy.duic.web.admin
 
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.mongodb.client.model.Filters
-import com.mongodb.client.model.Filters.and
+import com.mongodb.MongoWriteException
 import com.mongodb.reactivestreams.client.MongoDatabase
 import io.zhudy.duic.Config
 import io.zhudy.duic.domain.User
 import io.zhudy.duic.repository.UserRepository
 import io.zhudy.duic.server.Application
 import io.zhudy.duic.server.BeansInitializer
+import io.zhudy.duic.service.UserService
+import org.bson.Document
+import org.junit.After
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
-import org.springframework.boot.test.mock.mockito.MockitoTestExecutionListener
 import org.springframework.test.context.ActiveProfiles
 import org.springframework.test.context.ContextConfiguration
-import org.springframework.test.context.TestExecutionListeners
-import org.springframework.test.context.testng.AbstractTestNGSpringContextTests
+import org.springframework.test.context.junit4.SpringRunner
 import org.springframework.test.web.reactive.server.WebTestClient
-import org.testng.annotations.Test
+import reactor.core.publisher.Mono
 import reactor.core.publisher.toMono
 import java.util.*
 
 /**
  * @author Kevin Zou (kevinz@weghst.com)
  */
-@ActiveProfiles("test")
+@RunWith(SpringRunner::class)
+@ActiveProfiles("mongodb", "test")
 @SpringBootTest(classes = [Application::class], webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ContextConfiguration(initializers = [BeansInitializer::class])
-@TestExecutionListeners(MockitoTestExecutionListener::class)
-class AdminResourceTests : AbstractTestNGSpringContextTests() {
+class AdminResourceTests {
 
     @Autowired
     lateinit var mongoDatabase: MongoDatabase
     @Autowired
     lateinit var userRepository: UserRepository
-
+    @Autowired
+    lateinit var userService: UserService
     @Autowired
     lateinit var webTestClient: WebTestClient
-
     @Autowired
     lateinit var objectMapper: ObjectMapper
 
@@ -55,12 +73,32 @@ class AdminResourceTests : AbstractTestNGSpringContextTests() {
                         .expectStatus().isOk
                         .expectBody()
                         .consumeWith {
-                            val rs = objectMapper.readValue(it.responseBody, Map::class.java)
-                            _token = rs["token"] as String
+                            val cookie = it.responseCookies.getFirst("token")!!
+                            _token = cookie.value
                         }
             }
             return _token
         }
+
+    @Before
+    fun before() {
+        userService.insert(User(
+                email = Config.rootEmail,
+                password = Config.rootPassword
+        )).onErrorResume(MongoWriteException::class.java) {
+            if (it.error.code == 11000) { // duplicate key
+                return@onErrorResume Mono.empty()
+            }
+            throw it
+        }.block()
+    }
+
+    @After
+    fun after() {
+        mongoDatabase.getCollection("app").deleteMany(Document()).toMono().block()
+        mongoDatabase.getCollection("app_history").deleteMany(Document()).toMono().block()
+        mongoDatabase.getCollection("user").deleteMany(Document()).toMono().block()
+    }
 
     @Test
     fun rootUser() {
@@ -75,7 +113,7 @@ class AdminResourceTests : AbstractTestNGSpringContextTests() {
 
     @Test
     fun insertUser() {
-        val email = UUID.randomUUID().toString() + "@testng.com"
+        val email = UUID.randomUUID().toString() + "@unit-test.com"
 
         webTestClient.post()
                 .uri("/api/admins/users")
@@ -86,14 +124,11 @@ class AdminResourceTests : AbstractTestNGSpringContextTests() {
                 .cookie("token", token)
                 .exchange()
                 .expectStatus().isOk
-
-        // clean
-        userRepository.delete(email).subscribe()
     }
 
     @Test
     fun deleteUser() {
-        val email = UUID.randomUUID().toString() + "@testng.com"
+        val email = UUID.randomUUID().toString() + "@unit-test.com"
 
         userRepository.insert(User(email = email, password = "123456")).subscribe()
 
@@ -105,8 +140,19 @@ class AdminResourceTests : AbstractTestNGSpringContextTests() {
     }
 
     @Test
+    fun deleteUser2002() {
+        webTestClient.delete()
+                .uri("/api/admins/users/{email}", Config.rootEmail)
+                .cookie("token", token)
+                .exchange()
+                .expectStatus().isBadRequest
+                .expectBody()
+                .jsonPath("code").isEqualTo(2002)
+    }
+
+    @Test
     fun updateUserPassword() {
-        val email = UUID.randomUUID().toString() + "@testng.com"
+        val email = UUID.randomUUID().toString() + "@unit-test.com"
 
         webTestClient.post()
                 .uri("/api/admins/users")
@@ -129,8 +175,8 @@ class AdminResourceTests : AbstractTestNGSpringContextTests() {
                 .expectStatus().isOk
                 .expectBody()
                 .consumeWith {
-                    val rs = objectMapper.readValue(it.responseBody, Map::class.java)
-                    llToken = rs["token"] as String
+                    val cookie = it.responseCookies.getFirst("token")!!
+                    llToken = cookie.value
                 }
 
         webTestClient.put()
@@ -142,14 +188,11 @@ class AdminResourceTests : AbstractTestNGSpringContextTests() {
                 .cookie("token", llToken)
                 .exchange()
                 .expectStatus().isNoContent
-
-        // clean
-        userRepository.delete(email).subscribe()
     }
 
     @Test
     fun resetUserPassword() {
-        val email = UUID.randomUUID().toString() + "@testng.com"
+        val email = UUID.randomUUID().toString() + "@unit-test.com"
 
         userRepository.insert(User(email = email, password = "123456")).subscribe()
 
@@ -162,9 +205,21 @@ class AdminResourceTests : AbstractTestNGSpringContextTests() {
                 .cookie("token", token)
                 .exchange()
                 .expectStatus().isNoContent
+    }
 
-        // clean
-        userRepository.delete(email).subscribe()
+    @Test
+    fun resetUserPassword2003() {
+        webTestClient.patch()
+                .uri("/api/admins/users/password")
+                .syncBody(mapOf(
+                        "email" to Config.rootEmail,
+                        "password" to "123456"
+                ))
+                .cookie("token", token)
+                .exchange()
+                .expectStatus().isBadRequest
+                .expectBody()
+                .jsonPath("code").isEqualTo(2003)
     }
 
     @Test
@@ -203,11 +258,6 @@ class AdminResourceTests : AbstractTestNGSpringContextTests() {
                 ))
                 .exchange()
                 .expectStatus().isOk
-
-        // clean
-        mongoDatabase.getCollection("app").deleteMany(and(Filters.eq("name", name), Filters.eq("profile", profile)))
-                .toMono()
-                .subscribe()
     }
 
     @Test
@@ -237,11 +287,6 @@ class AdminResourceTests : AbstractTestNGSpringContextTests() {
                 ))
                 .exchange()
                 .expectStatus().isOk
-
-        // clean
-        mongoDatabase.getCollection("app").deleteMany(Filters.eq("name", name))
-                .toMono()
-                .subscribe()
     }
 
     @Test
@@ -265,17 +310,12 @@ class AdminResourceTests : AbstractTestNGSpringContextTests() {
                 .syncBody(mapOf(
                         "name" to name,
                         "profile" to profile,
-                        "description" to "hello testng"
+                        "description" to "hello unit-test"
                 ))
                 .exchange()
                 .expectStatus().isOk
                 .expectBody()
                 .jsonPath("v").isNumber
-
-        // clean
-        mongoDatabase.getCollection("app").deleteMany(and(Filters.eq("name", name), Filters.eq("profile", profile)))
-                .toMono()
-                .subscribe()
     }
 
     @Test
@@ -301,11 +341,6 @@ class AdminResourceTests : AbstractTestNGSpringContextTests() {
                 ))
                 .exchange()
                 .expectStatus().isOk
-
-        // clean
-        mongoDatabase.getCollection("app").deleteMany(and(Filters.eq("name", name), Filters.eq("profile", profile)))
-                .toMono()
-                .subscribe()
     }
 
     @Test
@@ -328,11 +363,6 @@ class AdminResourceTests : AbstractTestNGSpringContextTests() {
                 .cookie("token", token)
                 .exchange()
                 .expectStatus().isNoContent
-
-        // clean
-        mongoDatabase.getCollection("app_history").deleteMany(and(Filters.eq("name", name), Filters.eq("profile", profile)))
-                .toMono()
-                .subscribe()
     }
 
     @Test
@@ -358,11 +388,6 @@ class AdminResourceTests : AbstractTestNGSpringContextTests() {
                 .expectBody()
                 .jsonPath("name", name).exists()
                 .jsonPath("profile", profile).exists()
-
-        // clean
-        mongoDatabase.getCollection("app").deleteMany(and(Filters.eq("name", name), Filters.eq("profile", profile)))
-                .toMono()
-                .subscribe()
     }
 
     @Test
@@ -409,5 +434,4 @@ class AdminResourceTests : AbstractTestNGSpringContextTests() {
                 .expectStatus().isOk
                 .expectBody()
     }
-
 }

@@ -1,3 +1,18 @@
+/**
+ * Copyright 2017-2018 the original author or authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package io.zhudy.duic.web.admin
 
 import com.auth0.jwt.JWT
@@ -16,12 +31,14 @@ import io.zhudy.duic.web.body
 import io.zhudy.duic.web.pathString
 import io.zhudy.duic.web.security.userContext
 import org.joda.time.DateTime
+import org.springframework.http.ResponseCookie
 import org.springframework.stereotype.Controller
 import org.springframework.web.reactive.function.BodyExtractors
 import org.springframework.web.reactive.function.server.ServerRequest
 import org.springframework.web.reactive.function.server.ServerResponse
 import org.springframework.web.reactive.function.server.ServerResponse.noContent
 import org.springframework.web.reactive.function.server.ServerResponse.ok
+import org.springframework.web.reactive.function.server.body
 import reactor.core.publisher.Mono
 
 /**
@@ -45,7 +62,19 @@ class AdminResource(
             val token = JWT.create().withJWTId(it.email)
                     .withExpiresAt(DateTime.now().plusMinutes(Config.Jwt.expiresIn).toDate())
                     .sign(jwtAlgorithm)
-            ok().body(mapOf("token" to token))
+
+            ok().cookie(
+                    ResponseCookie.from("token", token)
+                            .maxAge(Config.Jwt.expiresIn.toLong())
+                            .httpOnly(true)
+                            .path("/")
+                            .build()
+            ).cookie(
+                    ResponseCookie.from("email", it.email)
+                            .maxAge(Config.Jwt.expiresIn.toLong())
+                            .path("/")
+                            .build()
+            ).build()
         }
     }
 
@@ -124,7 +153,7 @@ class AdminResource(
             throw BizCodeException(BizCode.Classic.C_999, "应用名称不能为空")
         }
         if (it.profile.isEmpty()) {
-            throw BizCodeException(BizCode.Classic.C_999, "应用配置不能为空")
+            throw BizCodeException(BizCode.Classic.C_999, "应用环境不能为空")
         }
 
         appService.insert(it).flatMap {
@@ -137,6 +166,12 @@ class AdminResource(
      */
     fun insertAppForApp(request: ServerRequest) = request.bodyToMono(App::class.java).flatMap { newApp ->
         appService.findOne(request.pathString("name"), request.pathString("profile")).flatMap {
+            if (newApp.name.isEmpty()) {
+                throw BizCodeException(BizCode.Classic.C_999, "应用名称不能为空")
+            }
+            if (newApp.profile.isEmpty()) {
+                throw BizCodeException(BizCode.Classic.C_999, "应用环境不能为空")
+            }
             newApp.content = it.content
 
             appService.insert(newApp).flatMap {
@@ -153,7 +188,7 @@ class AdminResource(
             throw BizCodeException(BizCode.Classic.C_999, "应用名称不能为空")
         }
         if (it.profile.isEmpty()) {
-            throw BizCodeException(BizCode.Classic.C_999, "应用配置不能为空")
+            throw BizCodeException(BizCode.Classic.C_999, "应用环境不能为空")
         }
 
         appService.update(it, request.userContext()).flatMap {
@@ -224,5 +259,16 @@ class AdminResource(
         return ok().body(appService.findLast50History(name, profile, request.userContext()),
                 AppContentHistory::class.java)
     }
+
+    fun findAllNames(request: ServerRequest) = appService.findAllNames().collectList().flatMap {
+        ok().body(it)
+    }
+
+    fun findProfilesByName(request: ServerRequest) = appService.findProfilesByName(request.pathString("name"))
+            .collectList()
+            .flatMap {
+                ok().body(it)
+            }
     // ======================================= APP ======================================================= //
+
 }

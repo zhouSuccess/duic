@@ -1,3 +1,20 @@
+<!--
+
+    Copyright 2017-2018 the original author or authors
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+-->
 <template>
     <v-card>
         <v-card-actions>
@@ -13,7 +30,7 @@
                 <td>{{props.item.email}}</td>
                 <td>{{props.item.created_at}}</td>
                 <td>{{props.item.updated_at}}</td>
-                <td align="center">
+                <td align="center" v-if="$store.state.rootEmail !== props.item.email">
                     <a @click="resetPwdDialog = true; standbyEmail = props.item.email">
                         <v-icon color="warning">fas fa-redo-alt</v-icon>
                     </a>
@@ -21,6 +38,7 @@
                         <v-icon color="red">fas fa-trash-alt</v-icon>
                     </a>
                 </td>
+                <td v-else></td>
             </template>
         </v-data-table>
 

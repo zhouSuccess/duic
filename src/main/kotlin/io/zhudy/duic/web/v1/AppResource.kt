@@ -1,3 +1,18 @@
+/**
+ * Copyright 2017-2018 the original author or authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package io.zhudy.duic.web.v1
 
 import io.zhudy.duic.BizCode
@@ -7,6 +22,7 @@ import io.zhudy.duic.service.AppService
 import io.zhudy.duic.web.WebConstants
 import io.zhudy.duic.web.body
 import io.zhudy.duic.web.pathString
+import io.zhudy.duic.web.queryTrimString
 import org.springframework.stereotype.Controller
 import org.springframework.util.StringUtils
 import org.springframework.web.reactive.function.server.ServerRequest
@@ -30,6 +46,18 @@ class AppResource(val appService: AppService) {
     fun getConfigState(request: ServerRequest): Mono<ServerResponse> {
         val vo = getRequestConfigVo(request)
         return appService.getConfigState(vo).flatMap {
+            ok().body(mapOf("state" to it))
+        }
+    }
+
+    /**
+     * 监控配置状态。
+     */
+    fun watchConfigState(request: ServerRequest): Mono<ServerResponse> {
+        val vo = getRequestConfigVo(request)
+        val oldState = request.queryParam("state").orElse("")
+
+        return appService.watchConfigState(vo, oldState).flatMap {
             ok().body(mapOf("state" to it))
         }
     }
@@ -103,7 +131,7 @@ class AppResource(val appService: AppService) {
         }
 
         val swe = request.attribute(WebConstants.SERVER_WEB_EXCHANGE_ATTR).get() as ServerWebExchange
-        val address = swe.request.remoteAddress.address
+        val address = swe.request.remoteAddress?.address
         if (address is Inet4Address) {
             return address.hostAddress
         }

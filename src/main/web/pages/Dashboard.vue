@@ -1,3 +1,20 @@
+<!--
+
+    Copyright 2017-2018 the original author or authors
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+-->
 <style lang="stylus" scoped>
     main
         width 100%
@@ -15,7 +32,7 @@
         </v-content>
 
         <!-- 未认证模式框 -->
-        <v-dialog v-model="noLoginDialog" max-width="290">
+        <v-dialog v-model="noLoginDialog" max-width="290" @input="$store.commit('loginState', true)">
             <v-card>
                 <v-card-title class="headline">登录过期/未登录</v-card-title>
                 <v-card-text>跳转至登录页面进行重新登录，会丢失当前页面操作</v-card-text>
@@ -50,7 +67,7 @@
             }
         },
         created() {
-            let state = !!Cookies.get('token')
+            let state = !!Cookies.get('email')
             if (state) {
                 let email = Cookies.get('email')
                 this.$store.commit('loginState', state)

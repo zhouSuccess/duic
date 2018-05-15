@@ -1,3 +1,18 @@
+/**
+ * Copyright 2017-2018 the original author or authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package io.zhudy.duic.service
 
 import io.zhudy.duic.BizCode
@@ -18,22 +33,39 @@ import io.zhudy.duic.vo.RequestConfigVo
 import org.bson.types.ObjectId
 import org.joda.time.DateTime
 import org.slf4j.LoggerFactory
-import org.springframework.cache.CacheManager
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Service
 import org.yaml.snakeyaml.Yaml
 import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
+import reactor.core.publisher.MonoSink
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.thread
+import kotlin.concurrent.withLock
 
 /**
+ * 应用配置逻辑处理实现。
+ *
  * @author Kevin Zou (kevinz@weghst.com)
  */
 @Service
-class AppService(val appRepository: AppRepository, cacheManager: CacheManager) {
+class AppService(val appRepository: AppRepository) {
 
     private val log = LoggerFactory.getLogger(AppService::class.java)
-    private val cache = cacheManager.getCache("apps")
+
+    private val appCaches = ConcurrentHashMap<String, CachedApp>()
+
+    private val watchStateMonoSinkTimeout = 30 * 1000
+    private val watchStateLock = ReentrantLock()
+    private val watchStateCond = watchStateLock.newCondition()
+    private val watchStateMonoSinks = ConcurrentHashMap<String, MutableList<WatchStateMonoSink>>()
+    private val updateAppQueue = LinkedBlockingQueue<String>()
+    private var minWatchStateMs = 0L
+
     private var lastUpdatedAt: Date? = null
     private var lastAppHistoryCreatedAt = Date()
     private val yaml = Yaml()
@@ -50,41 +82,57 @@ class AppService(val appRepository: AppRepository, cacheManager: CacheManager) {
             val properties: Map<Any, Any>
     )
 
-    @Scheduled(initialDelay = 0, fixedDelayString = "\${main.watch.fixed_delay:5000}")
+    /**
+     * 客户端监控状态的缓存对象。
+     */
+    private data class WatchStateMonoSink(
+            val monoSink: MonoSink<String>,
+            val configVo: RequestConfigVo,
+            val state: String,
+            val initTime: Long
+    )
+
+    init {
+        initResponseWatchState()
+    }
+
+    @Scheduled(initialDelay = 0,
+            fixedDelayString = "%{duic.app.watch.updated.fixed_delay:%{duic.app.watch.updated.fixed-delay:%{duic.app.watch.updated.fixedDelay:5000}}}")
     fun watchApps() {
         // 更新 APP 配置信息
         if (lastUpdatedAt == null) {
             findAll()
         } else {
             findByUpdatedAt(lastUpdatedAt!!)
-        }.sort { o1, o2 ->
-            // 按配置更新时间升序排列 updateAt
-            o1.updatedAt!!.compareTo(o2.updatedAt)
-        }.toStream().forEach {
-            cache.put(
-                    localKey(it.name, it.profile),
-                    mapToCachedApp(it)
-            )
+        }.doOnError {
+            log.error("refresh app config: ", it)
+        }.doFinally {
+            log.debug("lastUpdatedAt={}", lastUpdatedAt?.time)
+        }.subscribe {
+            val k = localKey(it.name, it.profile)
+            appCaches.put(k, mapToCachedApp(it))
             lastUpdatedAt = it.updatedAt!!.toDate()
+
+            updateAppQueue.offer(k)
         }
-        log.debug("lastUpdatedAt={}", lastUpdatedAt?.time)
     }
 
-    @Scheduled(initialDelay = 0, fixedDelayString = "\${main.watch_deleted.fixed_delay:600000}")
+    @Scheduled(initialDelay = 0,
+            fixedDelayString = "%{duic.app.watch.deleted.fixed_delay:%{duic.app.watch.deleted.fixed-delay:%{duic.app.watch.deleted.fixedDelay:600000}}}")
     fun watchDeletedApps() {
         // 清理已经删除的 APP
-        appRepository.findAppHistoryByCreatedAt(lastAppHistoryCreatedAt).sort { o1, o2 ->
-            // 按照配置删除的创建时间升序排列 createdAt
-            o1.createdAt?.compareTo(o2.createdAt) ?: 0
-        }.toStream().forEach {
-            cache.evict(localKey(it.name, it.profile))
+        appRepository.findDeletedByCreatedAt(lastAppHistoryCreatedAt).doOnError {
+            log.error("evict app config: ", it)
+        }.doFinally {
+            log.debug("lastAppHistoryCreatedAt={}", lastAppHistoryCreatedAt.time)
+        }.subscribe {
+            appCaches.remove(localKey(it.name, it.profile))
             lastAppHistoryCreatedAt = it.createdAt!!.toDate()
         }
-        log.debug("lastAppHistoryCreatedAt={}", lastAppHistoryCreatedAt.time)
     }
 
     /**
-     *
+     * 保存应用。
      */
     fun insert(app: App): Mono<*> {
         app.id = ObjectId().toHexString()
@@ -94,23 +142,23 @@ class AppService(val appRepository: AppRepository, cacheManager: CacheManager) {
     }
 
     /**
-     *
+     * 删除应用。
      */
     fun delete(app: App, userContext: UserContext) = checkPermission(app.name, app.profile, userContext).flatMap {
         appRepository.delete(app, userContext)
-    }!!
+    }
 
     /**
-     *
+     * 更新应用。
      */
     fun update(app: App, userContext: UserContext) = checkPermission(app.name, app.profile, userContext).flatMap {
         appRepository.update(app, userContext)
-    }!!
+    }
 
     /**
-     *
+     * 更新应用配置。
      */
-    fun updateContent(app: App, userContext: UserContext): Mono<Int> {
+    fun updateContent(app: App, userContext: UserContext): Mono<*> {
         try {
             yaml.load<Map<String, Any>>(app.content)
         } catch (e: Exception) {
@@ -123,7 +171,7 @@ class AppService(val appRepository: AppRepository, cacheManager: CacheManager) {
     }
 
     /**
-     *
+     * 获取配置状态。
      */
     fun getConfigState(vo: RequestConfigVo): Mono<String> {
         return loadAndCheckApps(vo).map { apps ->
@@ -136,7 +184,34 @@ class AppService(val appRepository: AppRepository, cacheManager: CacheManager) {
     }
 
     /**
-     *
+     * 监控配置状态。
+     */
+    fun watchConfigState(vo: RequestConfigVo, oldState: String) = getConfigState(vo).flatMap { state ->
+        if (state != oldState) {
+            return@flatMap Mono.just(state)
+        }
+        Mono.create<String> { sink ->
+            val ws = WatchStateMonoSink(sink, vo, state, System.currentTimeMillis())
+
+            watchStateLock.withLock {
+                vo.profiles.forEach {
+                    val k = localKey(vo.name, it)
+                    val a = watchStateMonoSinks[k] ?: mutableListOf()
+                    a.add(ws)
+
+                    watchStateMonoSinks[k] = a
+                }
+
+                if (minWatchStateMs == 0L) {
+                    minWatchStateMs = ws.initTime
+                    watchStateCond.signalAll()
+                }
+            }
+        }
+    }
+
+    /**
+     * 获取兼容 `spring-cloud` 格式的配置。
      */
     fun loadSpringCloudConfig(vo: RequestConfigVo): Mono<SpringCloudResponseDto> {
         return loadAndCheckApps(vo).map { apps ->
@@ -151,16 +226,12 @@ class AppService(val appRepository: AppRepository, cacheManager: CacheManager) {
     }
 
     /**
-     *
+     * 获取配置。
      */
-    fun loadConfigByNameProfile(vo: RequestConfigVo): Mono<Map<Any, Any>> {
-        return loadAndCheckApps(vo).map {
-            mergeProps(it)
-        }
-    }
+    fun loadConfigByNameProfile(vo: RequestConfigVo) = loadAndCheckApps(vo).map(::mergeProps)
 
     /**
-     *
+     * 获取某个 `key` 的具体配置。
      */
     fun loadConfigByNameProfileKey(vo: RequestConfigVo): Mono<Any> {
         return loadConfigByNameProfile(vo).map {
@@ -172,6 +243,7 @@ class AppService(val appRepository: AppRepository, cacheManager: CacheManager) {
                     break
                 }
                 if (v is Map<*, *>) {
+                    @Suppress("UNCHECKED_CAST")
                     props = v as Map<Any, Any>
                 }
             }
@@ -187,27 +259,29 @@ class AppService(val appRepository: AppRepository, cacheManager: CacheManager) {
     }
 
     /**
-     *
+     * 查询指定的应用详细信息。
      */
     fun findOne(name: String, profile: String) = appRepository.findOne<Any>(name, profile)
 
     /**
-     *
+     * 查询所有应用详细信息。
      */
     fun findAll(): Flux<App> = appRepository.findAll()
 
     /**
+     * 查询在指定更新时间之后的应用详细信息。
      *
+     * @param updateAt 更新时间
      */
     fun findByUpdatedAt(updateAt: Date): Flux<App> = appRepository.findByUpdatedAt(updateAt)
 
     /**
-     *
+     * 分页查询应用详细信息。
      */
     fun findPage(pageable: Pageable): Mono<Page<App>> = appRepository.findPage(pageable)
 
     /**
-     *
+     * 分页查询用户所有的应用详细信息。
      */
     fun findPageByUser(pageable: Pageable, userContext: UserContext): Mono<Page<App>> = if (userContext.isRoot) {
         findPage(pageable)
@@ -225,12 +299,22 @@ class AppService(val appRepository: AppRepository, cacheManager: CacheManager) {
     }
 
     /**
-     *
+     * 查询应用更新的最新 50 条更新记录。
      */
     fun findLast50History(name: String, profile: String, userContext: UserContext)
             = checkPermission(name, profile, userContext).flatMapMany {
         appRepository.findLast50History(name, profile)
-    }!!
+    }
+
+    /**
+     * 查询所有应用名称。
+     */
+    fun findAllNames() = appRepository.findAllNames()
+
+    /**
+     * 查询应用下所有的环境名称。
+     */
+    fun findProfilesByName(name: String) = appRepository.findProfilesByName(name)
 
     private fun checkPermission(name: String, profile: String, userContext: UserContext): Mono<Unit> {
         if (userContext.isRoot) {
@@ -275,22 +359,18 @@ class AppService(val appRepository: AppRepository, cacheManager: CacheManager) {
         }
     }).collectList()
 
-    /**
-     *
-     */
     private fun loadOne(name: String, profile: String): Mono<CachedApp> {
         val k = localKey(name, profile)
-        return Mono.justOrEmpty(cache.get(k, CachedApp::class.java))
+        return Mono.justOrEmpty<CachedApp>(appCaches[k])
                 .switchIfEmpty(
                         findOne(name, profile).map {
                             val ca = mapToCachedApp(it)
-                            cache.put(k, ca)
+                            appCaches.put(k, ca)
                             ca
                         }.switchIfEmpty(Mono.create {
                             it.error(BizCodeException(BizCodes.C_1000, "未找到应用 $name/$profile"))
                         })
                 )
-
     }
 
     private fun mergeProps(apps: List<CachedApp>): Map<Any, Any> {
@@ -305,6 +385,7 @@ class AppService(val appRepository: AppRepository, cacheManager: CacheManager) {
         return m
     }
 
+    @Suppress("UNCHECKED_CAST")
     private fun mergeProps(a: MutableMap<Any, Any>, b: MutableMap<Any, Any>, prefix: String = "") {
         if (a.isEmpty()) {
             a.putAll(b)
@@ -335,6 +416,7 @@ class AppService(val appRepository: AppRepository, cacheManager: CacheManager) {
         return result
     }
 
+    @Suppress("UNCHECKED_CAST")
     private fun buildFlattenedMap(result: MutableMap<String, Any>, source: Map<Any, Any>, path: String) {
         for (entry in source.entries) {
             var key: String = entry.key as? String ?: entry.key.toString()
@@ -396,4 +478,72 @@ class AppService(val appRepository: AppRepository, cacheManager: CacheManager) {
     }
 
     private fun localKey(name: String, profile: String) = "${name}_$profile"
+
+    private fun initResponseWatchState() {
+        thread(isDaemon = true, name = "response-watch-app-state") {
+            while (true) {
+                try {
+                    val k = updateAppQueue.take()
+                    val a = watchStateLock.withLock {
+                        watchStateMonoSinks.remove(k)
+                    }
+
+                    a?.forEach { stateMonoSink ->
+                        try {
+                            getConfigState(stateMonoSink.configVo).subscribe {
+                                stateMonoSink.monoSink.success(it)
+                            }
+                        } catch (e: Exception) {
+                            stateMonoSink.monoSink.error(e)
+                        }
+                    }
+                } catch (e: Exception) {
+                    log.error("通知更新状态错误", e)
+                }
+            }
+        }
+
+        thread(isDaemon = true, name = "default-response-watch-app-state") {
+            while (true) {
+                try {
+                    watchStateLock.withLock {
+
+                        if (minWatchStateMs != 0L) {
+                            watchStateCond.await(System.currentTimeMillis() - minWatchStateMs, TimeUnit.MILLISECONDS)
+                        } else {
+                            watchStateCond.await()
+                        }
+
+                        var t = 0L
+
+                        watchStateMonoSinks.entries.forEach { entry ->
+                            val mlist = entry.value
+
+                            mlist.toList().forEach {
+                                val to = it.initTime + watchStateMonoSinkTimeout
+                                if (to <= System.currentTimeMillis()) {
+                                    it.monoSink.success(it.state)
+
+                                    // 清理
+                                    if (mlist.size <= 1) {
+                                        watchStateMonoSinks.remove(entry.key)
+                                    } else {
+                                        mlist.remove(it)
+                                    }
+                                } else {
+                                    if (t == 0L || it.initTime < t) {
+                                        t = it.initTime
+                                    }
+                                }
+                            }
+                        }
+
+                        minWatchStateMs = t
+                    }
+                } catch (e: Exception) {
+                    log.error("默认状态响应错误", e)
+                }
+            }
+        }
+    }
 }
